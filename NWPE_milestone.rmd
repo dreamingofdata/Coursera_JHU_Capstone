@@ -1,0 +1,283 @@
+---
+title: "Next Word Prediction Engine"
+author: "Bill Kimler"
+output: html_document
+---
+#Introduction
+The __Next Word Prediction Engine__ seeks to quickly anticipate the next word in a sequence of words entered by a user. Making using of a 4 million+ collection of tweets, blogs and new documents, this engine first learns word patterns in groups (_n-grams_) of 2, 3 and 4-word combinations. Using statistical frequencies of these n-grams, the top likely candidates for the next word will be calculated. A proof-of-concept application for this engine will be created using [shiny](http://shiny.rstudio.com/).
+
+This endeavor offers a number of challenges including:
+
+* Managing a large amount of data within constraints of time and physical hardware
+* Word processing to collect relevant data and be efficient with disk and memory utilization
+* Content filtering for inappropriate language (do not want the engine to offer up vulgarity as a next word)
+* Speed of word suggestion (application will not be effective if the user has to wait a long time for suggestions)
+
+```{r, echo = TRUE, warning=FALSE, message=FALSE, error=FALSE, results='hide'}
+library(data.table)     # for fread()
+library(quanteda)       # main NLP library
+library(knitr)          # for controll markdown options
+library(pryr)           # Memory usage tools
+library(wordcloud)      # for the useless, obligatory wordcloud
+setwd("D:\\gitstuff\\Coursera_JHU_Capstone")
+```
+
+```{r setoptions, echo=FALSE}
+opts_chunk$set(echo = TRUE)
+```
+
+
+#Data Processing
+###Table loading
+The data was presented as three separate, large files ([source](https://d396qusza40orc.cloudfront.net/dsscapstone/dataset/Coursera-SwiftKey.zip)). These files were read into memory using the `fread()` function in the `data.table` package.
+```{r, echo = TRUE, warning=FALSE, message=FALSE, error=FALSE, results='hide'}
+if (file.exists("totalCorpus.RData")) {
+  #Look for locally saved model file and use it if found
+  load(file = "totalCorpus.RData")
+} else{
+  #Tweets
+  tweets<-as.character(fread("C:/Progra~2/GnuWin32/bin/sed.exe s/\\x00//g final/en_US/en_US.twitter.txt",
+                             sep='\n', 
+                             header=FALSE,
+                             encoding = "UTF-8")$V1)
+  tweetsCorpus <- corpus(tweets)
+
+  #News articles
+  news<-as.character(fread("final/en_US/en_US.news.txt",
+                           sep='\n',
+                           header=FALSE,
+                           encoding = "UTF-8")$V1)
+  newsCorpus <- corpus(news)
+
+  #Blogs
+  blogs<-as.character(fread("final/en_US/en_US.blogs.txt",
+                           sep='\n',
+                           header=FALSE,
+                           encoding = "UTF-8")$V1)
+  blogsCorpus <- corpus(blogs)
+
+  totalCorpus <- tweetsCorpus + newsCorpus + blogsCorpus
+  
+  #Save the model for use later, rather than retraining each time
+  save(totalCorpus, file="totalCorpus.RData")
+  
+  #Remove objects no longer necessary and garbace collect.
+  rm(tweets)
+  rm(tweetsCorpus)
+  rm(news)
+  rm(newsCorpus)
+  rm(blogs)
+  rm(blogsCorpus)
+  gc()
+}
+```
+
+###Preliminary statistics
+```{r}
+#Total number of documents found in the corpus
+corpus_size = nrow(totalCorpus$documents)
+formatC(corpus_size, format="d", big.mark=',')
+#Corpus filesize (MB)
+formatC(file.size("totalCorpus.RData")/1024^2, digits=4)
+#Memory space occupied by the total corpus
+object_size(totalCorpus)
+```
+
+#The Corpus and its Words
+The standard process in `quanteda` is to construct a *Document Feature Matrix* from a corpus of documents.Attempting to build this dfm looking only at unique words in the corpuse results in a memory error (on a 16 GB machine), so the following will not be executed.
+```{r, eval=FALSE}
+#Results in out-of-memory errors
+mydfm <- dfm(totalCorpus, ngrams=1, removePunct = TRUE, removeTwitter = TRUE, removeURL = TRUE, toLower = TRUE)
+```
+Instead, analysis was performed from the bottom up to determine what percentage of documents would contain a representative of the words found in the English language.
+
+The following loop processed the corpus in increasing amounts from 1% to 40%, taking a random sample of documents (mixture of tweets, blogs and news articles). 
+
+In each iteration, the words were extracted from a portion of corpus to create a DFM. From this DFM a named vector of unique words and their respective counts was extracted and then filtered against an [English word list](https://github.com/dwyl/english-words). This list was chosen from a google search and could stand to have some vetting performed (such as an exploration of contractions like "it's" or "how've"). But for the purposes of this project, this one was chosen.
+```{r}
+my_dictionary <- read.csv("https://github.com/dwyl/english-words/blob/master/words.txt?raw=true", stringsAsFactors = FALSE, header = FALSE, quote='')
+my_dictionary[1000:1005,]
+```
+
+###Spread metric
+For each iteration, the number of unique words was captured along with a value called the *spread* - a metric invented for this exercise to measure how representative this list of words is for the full corpus. The spread is defined as
+$$\frac{\textrm{# unique words}}{\textrm{total word count in corpus}}$$
+
+The goal of this metric is to give weight to word lists that have heavily clustered words (large number of instances and a few number of words). When comparing two word lists, the one with the larger *spread* has more words with fewer counts per word on average. So while larger word lists have a larger word count, it's spread may not have changed that much due to the addition of rarely seen words.
+
+For example,
+```{r}
+#Word List 1
+# and   the   muffin   frog    chupacabra
+#  10     9        3      1             1
+# spread = 24/5 = 4.8
+
+
+#Word List 2
+# and   the   muffin   frog    chupacabra   salacious
+#  11    12        3      1             1           1
+# spread = 2/6 = 4.83
+```
+So while the second word list contains more words with the addition of the word "salacious",the list has a similar spread and may not contribute much more to a predictive engine.
+
+It's expected that the spread will decrease as more of the corpus is processed. The question is to select a sweet point that will provide a solid number of words without containing excessive rarely used ones.
+
+## Word count analysis routine
+
+```{r, fig.height=10}
+if (file.exists("wordCountAnalysis.Rdata")) {
+  #Look for locally saved analysis file and use it if found
+  load(file = "wordCountAnalysis.Rdata")
+} else {
+  trials = 50
+  unique_word_count = rep(NA, trials)
+  spread_value = rep(NA, trials)
+  
+  for (i in 1:trials){
+    print(paste("processing", i, '% of corpus'))
+    corpus_percent = i/100 #Grab % of the documents at random
+    sample_idx <- sample(corpus_size, corpus_percent*corpus_size)
+    mydfm <- dfm(totalCorpus[sample_idx], ngrams=1, removePunct = TRUE, 
+                 removeTwitter = TRUE, removeURL = TRUE)
+    token_counts <- topfeatures(mydfm, n=dim(mydfm)[2])
+    token_counts <- token_counts[intersect(names(token_counts), my_dictionary$V1)]
+    unique_word_count[i] = length(token_counts)
+    spread_value[i] = length(token_counts)/sum(token_counts)
+  }
+  #Save the stats
+  save(unique_word_count, spread_value, file="wordCountAnalysis.Rdata")
+}
+options(scipen=6)
+par(mfrow = c(2,1))
+plot(unique_word_count, type='b', ylim = c(0, 100000))
+abline(v=25, col='red')
+plot(log(spread_value), type='b', ylim = c(-8, -0))
+abline(v=25, col='red')
+```
+
+Based on the above graph, it was decided that a quarter of the corpus would be processed for the remaining project. So one last look at word frequencies for 25% of the corpus, ignoring stop words for this visualization:
+```{r, echo = TRUE, warning=FALSE, message=FALSE, error=FALSE, results='hide'}
+corpus_percent = 25/100 #Grab % of the documents at random
+sample_idx <- sample(corpus_size, corpus_percent*corpus_size)
+mydfm <- dfm(totalCorpus[sample_idx], ngrams=1, removePunct = TRUE, 
+             removeTwitter = TRUE, removeURL = TRUE, 
+             ignoredFeatures = stopwords("english"))
+#Top 100 words
+token_counts <- topfeatures(mydfm, n=100)
+```
+
+```{r, fig.height=8,}
+wordcloud(names(token_counts), token_counts, random.color=TRUE, colors=brewer.pal(10, 'BrBG'))
+```
+
+
+The large majority of the top 100 words are monosyllabic
+
+#The Corpus and n-grams
+The primary purpose of this engine is to predict a word based or one or more previously entered words. To this end, the extraction of *n-grams* is required. 
+
+Some initial setup, including the selection of corpus indices and a dataframe to store some statistics of the n-gram processing.
+
+```{r }
+corpus_percent = 25/100 #Grab % of the documents at random
+ptm <- proc.time()      #Capture starting time for performance analysis
+set.seed(1)
+sample_idx <- sample(corpus_size, corpus_percent*corpus_size)
+
+#statistics to track
+my_row_names <- c("corpus_percent", "sentences","ngrams_count","lookup_phrase_count","prediction_word_count","data_table_size_mb","file_size_mb","process_time_sec")
+stats = data.frame(rep(0,length(my_row_names)), row.names = my_row_names)
+names(stats) <- 'value'
+stats['corpus_percent', 'value'] = corpus_percent * 100
+```
+
+`quanteda`'s `dfm()` allows for the specification of n-gram sizes when examining a corpus. It has built-in capabilities to remove punctuation, convert all text to lower-case and look for and remove patterns found in Twitter documents.
+
+The first step, however, is to parse each document into its individual sentences so that n-grams are not constructs across sentences. For example, if a tweet had *"How are you? Windshield wipers have become expensive"* we would not want *"you windshield" to be captured as a viable n-gram.
+```{r}
+if (file.exists("sentences.Rdata")) {
+  load(file = "sentences.Rdata")
+} else {
+  sentence_tokens <- toLower(tokenize(totalCorpus[sample_idx], what = "sentence", simplify = TRUE))
+  save(sentence_tokens, file = "sentences.Rdata")
+}
+stats['sentences', 'value'] = length(sentence_tokens)
+paste(formatC(length(sentence_tokens), format="d", big.mark=','), "sentences in the corpus portion")
+```
+
+Once the sentences have been extracted, the corpus is processed 3 times: once for 2-grams, once for 3-grams and finally for 4-grams. 
+
+In each pass, the n-gram is separated into a *lookup phrase* and a *prediction word*. For example, the 4-gram *"weapons of mass destruction"* would be broken out into *"weapons of mass"* and *"destruction"*. Unique combinations of the lookup phrases, associated prediction words and their frequency counts were stored in a `data.table`. The results of each pass are saved to a data file.
+
+```{r}
+if (file.exists("ngrams.Rdata")) {
+  load(file = "ngrams.Rdata")
+  load(file = "ngrams_stats.Rdata")
+} else {
+  for (n_gram_size in 2:4){
+    mydfm <- dfm(sentence_tokens, concatenator = " ", ngrams=n_gram_size, removePunct = TRUE, removeTwitter = TRUE, removeURL = TRUE)
+    
+    #Produce named list of n-gram counts with the names being the n-gram tokens
+    token_counts <- topfeatures(mydfm, n=dim(mydfm)[2])
+    stats['ngrams_count', 'value'] = stats['ngrams_count', 'value'] + length(token_counts)
+  
+    token_index <- 1:dim(mydfm)[2]
+    #Grab the lookup phrases
+    lookup <- unlist(strsplit(names(token_counts), split=" (?!.* )", perl=TRUE))[token_index * 2 - 1]
+    #Grab the prediction words
+    prediction <- unlist(strsplit(names(token_counts), split=" (?!.* )", perl=TRUE))[token_index * 2]
+  
+    #condense for uniqueness - purely for statistical reasons
+    unique_lookup <- unique(lookup)
+    unique_prediction <- unique(prediction)
+    
+    stats['lookup_phrase_count', 'value'] = stats['lookup_phrase_count', 'value'] + length(unique_lookup)
+    stats['prediction_word_count', 'value'] = stats['prediction_word_count', 'value'] + length(unique_prediction)
+    
+    #Begin construction of file data table for this n-gram size
+    ngram_counts <- as.vector(unname(token_counts))
+    
+    #Dynamically create variables dt2, dt3, dt4 to save the n-gram data
+    dt <- data.table(lookup, prediction, ngram_counts)
+    names(dt) <- c("lookup", "prediction", "count")
+    setorder(dt, lookup, -count)
+    setkey(dt, lookup)
+    
+    #Save n-gram data to its own variable name (dt1, dt2, etc)
+    assign(paste("dt", n_gram_size, sep=""),dt)
+  }
+  #Continuing statistics gathering
+  save(dt2, dt3, dt4, file='ngrams.Rdata')
+  stats['data_table_size_mb', 'value'] = object.size(dt)/2^20
+  stats['file_size_mb', 'value'] = file.size("ngrams.Rdata")/2^20
+  stats['process_time_sec', 'value'] = (proc.time()-ptm)['elapsed']
+  save(stats, file='ngrams_stats.Rdata')
+}
+stats$value <- formatC(stats$value, big.mark=',', digits=10, mode='integer')
+stats
+```
+
+With the n-gram data tables constructed, a lookup phrase can be used to quickly retrieve all of the prediction words and their frequencies within the corpus. For example:
+```{r}
+#Test lookup
+print(dt2['it'][1:5])
+print(dt3['it goes'][1:5])
+print(dt4['it goes with'][1:5])
+```
+
+#Word Prediction Strategy
+With the data table constructed, a predictive engine would be built next that would:
+
+* take a submitted phrase and grab the last word, last two words and last three words (if the length of the phrase allows it)
+* look up these predictive phrases in the `dt2`, `dt3` and `dt4` n-gram data tables.
+* determine the relative frequencies of the resulting `prediction words'
+* use *backoff* technique to compute the probabilities of the `predict` words using a weighted sum of the probabilities of the 3 n-gram sizes
+$$P(w_{predict}|w_1 w_2 w_3) = \lambda{_1} P(w_{predict}|w_1) + \lambda_2 P(w_{predict}|w_2) + \lambda_3 P(w_{predict}|w_3)$$
+where $P(w_{predict}|w_1)$ is the probability of seeing $w_{predict}$ given the one-word *lookup* phrase $w_1$, $P(w_{predict}|w_2)$ is the probability of seeing $w_{predict}$ given the 2-word lookup phrase $w_2$, etc. The $\lambda$'s are weights to be determined.
+
+#Next Steps
+* Profanity filtering on the *predict* words (might as well leave them in on the *lookup* phrases, but I certainly wouldn't want to offer up profanity as a suggestion)
+* Reduce the size of the data tables to retain only the top five *predict* words for each *lookup* n-gram.
+* Potentially reduce the number of *lookup* n-grams if more speed & efficiency is needed
+* Develop the code to parse an input phrase and quickly return the top 5 words based on the above prediction strategy.
+* Apply prediction engine to a test data set pulled from the corpus where a random 4 word phrase is pulled, the first 3 words used as a *lookup* and test whether the any of the 5 *predicted* words match the actual final word.
